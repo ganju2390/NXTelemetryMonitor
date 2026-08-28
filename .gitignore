@@ -2,3 +2,9 @@
 __pycache__/
 *.pyc
 *.csv
+!trajectories/
+!trajectories/*.csv
+!training_trajectories/
+!training_trajectories/**/*.csv
+!training_trajectories/v2/
+!training_trajectories/v2/**/*.csv

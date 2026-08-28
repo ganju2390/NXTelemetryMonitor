@@ -28,6 +28,16 @@ from apriltag_localization import (
     load_camera_calibration,
     load_tag_layout,
 )
+from trajectory_tracking import (
+    PoseEstimate,
+    TrackingSettings,
+    TrajectoryError,
+    TrajectoryFollower,
+    TrackingCommand,
+    Waypoint,
+    normalize_angle,
+    load_waypoints,
+)
 
 
 PACKET_STRUCT = struct.Struct("<6f8hf4B")
@@ -41,9 +51,25 @@ CONTROL_HEADER = 0xAA
 CONTROL_PAYLOAD_STRUCT = struct.Struct("<5f3B2b6f")
 CONTROL_FRAME_SIZE = 1 + CONTROL_PAYLOAD_STRUCT.size + 2
 CONTROL_PERIOD_MS = 20
+CSV_INTERPOLATION_FLUSH_SECONDS = 0.55
 PERCEPTION_ROOT = Path(r"D:\fins\tools\finsrov_perception")
 CAMERA_CALIBRATION_PATH = PERCEPTION_ROOT / "calibration" / "rgb_camera.yaml"
 TAG_LAYOUT_PATH = Path(__file__).with_name("apriltag_layout.json")
+TRAJECTORY_ROOT = Path(__file__).with_name("training_trajectories")
+DATASET_ROOT = Path(__file__).with_name("dataset")
+TRAJECTORY_VERSIONS = ("v2", "v1")
+
+
+def trajectory_directory_for(version: str) -> Path:
+    if version not in TRAJECTORY_VERSIONS:
+        raise ValueError(f"不支持的轨迹版本：{version}")
+    return TRAJECTORY_ROOT / version
+
+
+def dataset_directory_for(version: str) -> Path:
+    if version not in TRAJECTORY_VERSIONS:
+        raise ValueError(f"不支持的数据集版本：{version}")
+    return DATASET_ROOT / version
 
 
 class PacketError(ValueError):
@@ -65,6 +91,13 @@ def build_control_frame(
     forward_speed: float = 0.0,
     left_right_speed: float = 0.0,
     start_button: int = 0,
+    enable_path_tracking: int = 0,
+    global_x: float = 0.0,
+    global_y: float = 0.0,
+    global_yaw: float = 0.0,
+    global_x_velocity: float = 0.0,
+    global_y_velocity: float = 0.0,
+    global_yaw_rate: float = 0.0,
 ) -> bytes:
     """Build the exact 52-byte Streamer frame accepted by the A-board."""
     payload = CONTROL_PAYLOAD_STRUCT.pack(
@@ -75,15 +108,15 @@ def build_control_frame(
         0.0,  # upSpeed
         start_button,
         0,  # fillLight
-        0,  # enablePathTracking
+        enable_path_tracking,
         0,  # camYaw
         0,  # camPitch
-        0.0,  # globalX
-        0.0,  # globalY
-        0.0,  # globalYaw
-        0.0,  # globalXVelocity
-        0.0,  # globalYVelocity
-        0.0,  # globalYawRate
+        global_x,
+        global_y,
+        global_yaw,
+        global_x_velocity,
+        global_y_velocity,
+        global_yaw_rate,
     )
     frame_without_crc = bytes((CONTROL_HEADER,)) + payload
     return frame_without_crc + struct.pack("<H", crc16_modbus(frame_without_crc))
@@ -284,8 +317,6 @@ class CsvRecorder:
 
     FIELDNAMES = [
         "received_utc",
-        "source_ip",
-        "source_port",
         "pressure",
         "acc_x",
         "acc_y",
@@ -294,19 +325,10 @@ class CsvRecorder:
         "yaw",
         *(f"int_rpm_{index}" for index in range(1, 9)),
         "firmware_timestamp",
-        "timestamp_delta",
-        "timestamp_continuous",
-        "timestamp_missing_frames",
-        "vision_capture_utc",
-        "vision_age_ms",
-        "vision_valid",
-        "vision_x_m",
-        "vision_y_m",
-        "vision_yaw_rad",
-        "vision_tag_ids",
-        "vision_tag_count",
-        "vision_reprojection_error_px",
-        "vision_status",
+        "tag_timestamp_utc",
+        "tag_x_m",
+        "tag_y_m",
+        "tag_yaw_rad",
     ]
 
     def __init__(self, interpolator: VisionInterpolator) -> None:
@@ -372,9 +394,13 @@ class CsvRecorder:
                 writer = csv.DictWriter(csv_file, fieldnames=self.FIELDNAMES)
                 writer.writeheader()
                 pending: deque[PacketEvent] = deque()
-                while not stop_event.is_set() or not events.empty():
+                stop_deadline: float | None = None
+                while True:
+                    if stop_event.is_set() and stop_deadline is None:
+                        # 停止采集后给相机一小段时间提供最后的插值右边界。
+                        stop_deadline = time.monotonic() + CSV_INTERPOLATION_FLUSH_SECONDS
                     try:
-                        pending.append(events.get(timeout=0.2))
+                        pending.append(events.get(timeout=0.05))
                     except queue.Empty:
                         pass
                     while pending:
@@ -395,12 +421,9 @@ class CsvRecorder:
                                 continue
                             break
                         pending.popleft()
-                        result = event.timestamp_result
                         writer.writerow(
                             {
                                 "received_utc": packet.received_utc,
-                                "source_ip": packet.source_ip,
-                                "source_port": packet.source_port,
                                 "pressure": packet.pressure,
                                 "acc_x": packet.acc_x,
                                 "acc_y": packet.acc_y,
@@ -409,23 +432,20 @@ class CsvRecorder:
                                 "yaw": packet.yaw,
                                 **{f"int_rpm_{index}": rpm for index, rpm in enumerate(packet.rpms, start=1)},
                                 "firmware_timestamp": packet.timestamp,
-                                "timestamp_delta": "" if result.delta is None else result.delta,
-                                "timestamp_continuous": int(result.continuous),
-                                "timestamp_missing_frames": result.missing_frames,
-                                "vision_capture_utc": vision.captured_utc,
-                                "vision_age_ms": 0.0,
-                                "vision_valid": 1,
-                                "vision_x_m": vision.x_m,
-                                "vision_y_m": vision.y_m,
-                                "vision_yaw_rad": vision.yaw_rad,
-                                "vision_tag_ids": " ".join(str(tag_id) for tag_id in vision.tag_ids),
-                                "vision_tag_count": len(vision.tag_ids),
-                                "vision_reprojection_error_px": vision.reprojection_error_px,
-                                "vision_status": vision.message,
+                                # 插值定位与此 NX 遥测同一主机时刻对齐。
+                                "tag_timestamp_utc": packet.received_utc,
+                                "tag_x_m": vision.x_m,
+                                "tag_y_m": vision.y_m,
+                                "tag_yaw_rad": vision.yaw_rad,
                             }
                         )
                         with self._lock:
                             self.records_written += 1
+                    if stop_event.is_set() and events.empty():
+                        if not pending:
+                            break
+                        if stop_deadline is not None and time.monotonic() >= stop_deadline:
+                            break
                 with self._lock:
                     self.interpolation_dropped += len(pending)
         finally:
@@ -554,6 +574,10 @@ class TelemetryMonitorApp:
         self.vision_interpolator = VisionInterpolator()
         self.recorder = CsvRecorder(self.vision_interpolator)
         self.control_transmitter = ControlTransmitter()
+        self.trajectory_follower = TrajectoryFollower()
+        self.loaded_waypoints: tuple[Waypoint, ...] | None = None
+        self.loaded_trajectory_path: Path | None = None
+        self.last_tracking_command: TrackingCommand | None = None
         self.vision_events: queue.Queue[VisionFrame] = queue.Queue(maxsize=2)
         self.camera_scan_events: queue.Queue[tuple[int, ...]] = queue.Queue(maxsize=1)
         self.vision_worker: CameraLocalisationWorker | None = None
@@ -573,10 +597,15 @@ class TelemetryMonitorApp:
         self.control_port_var = tk.StringVar(value="54322")
         self.translation_scale_var = tk.DoubleVar(value=1.0)
         self.yaw_scale_var = tk.DoubleVar(value=1.0)
-        self.y_axis_min_var = tk.StringVar(value="-20000")
-        self.y_axis_max_var = tk.StringVar(value="20000")
-        self.chart_y_min = -20000.0
-        self.chart_y_max = 20000.0
+        self.trajectory_position_kp_var = tk.StringVar(value="0.70")
+        self.trajectory_velocity_kp_var = tk.StringVar(value="1.00")
+        self.trajectory_yaw_kp_var = tk.StringVar(value="0.50")
+        self.trajectory_slew_var = tk.StringVar(value="1.00")
+        self.trajectory_version_var = tk.StringVar(value="v2")
+        self.y_axis_min_var = tk.StringVar(value="-3000")
+        self.y_axis_max_var = tk.StringVar(value="3000")
+        self.chart_y_min = -3000.0
+        self.chart_y_max = 3000.0
         self.camera_index_var = tk.StringVar(value="4")
         self.listener_status_var = tk.StringVar(value="未监听")
         self.rate_var = tk.StringVar(value="0.0 Hz")
@@ -586,6 +615,7 @@ class TelemetryMonitorApp:
         self.latest_var = tk.StringVar(value="压力: --   Yaw: --")
         self.recording_var = tk.StringVar(value="未采集")
         self.control_status_var = tk.StringVar(value="控制目标：192.168.0.2:54322；键盘未按下")
+        self.trajectory_status_var = tk.StringVar(value="轨迹：未加载；手动控制")
         self.vision_status_var = tk.StringVar(value="视觉定位：相机未启动")
         self.vision_pose_var = tk.StringVar(value="全局（相机坐标）X: --   Y: --   yaw: --")
 
@@ -602,10 +632,11 @@ class TelemetryMonitorApp:
         root_frame.pack(fill=tk.BOTH, expand=True)
         root_frame.columnconfigure(0, weight=0, minsize=560)
         root_frame.columnconfigure(1, weight=1, minsize=640)
-        root_frame.rowconfigure(1, weight=1)
+        root_frame.rowconfigure(0, weight=1, minsize=360)
+        root_frame.rowconfigure(1, weight=1, minsize=300)
 
         configuration_panel = ttk.Frame(root_frame)
-        configuration_panel.grid(row=0, column=0, sticky=tk.NSEW, padx=(0, 8))
+        configuration_panel.grid(row=0, column=0, rowspan=2, sticky=tk.NSEW, padx=(0, 8))
 
         config = ttk.LabelFrame(configuration_panel, text="UDP 监听配置", padding=8)
         config.pack(fill=tk.X)
@@ -649,6 +680,30 @@ class TelemetryMonitorApp:
         )
         ttk.Label(control, textvariable=self.control_status_var).grid(row=3, column=0, columnspan=6, pady=(5, 0), sticky=tk.W)
 
+        trajectory = ttk.LabelFrame(configuration_panel, text="CSV 轨迹规划（AprilTag 位姿）", padding=8)
+        trajectory.pack(fill=tk.X, pady=(8, 0))
+        ttk.Button(trajectory, text="选择轨迹 CSV", command=self.choose_trajectory).grid(row=0, column=0, sticky=tk.W)
+        ttk.Button(trajectory, text="启动轨迹", command=self.start_trajectory).grid(row=0, column=1, padx=(8, 0))
+        ttk.Button(trajectory, text="停止轨迹", command=self.stop_trajectory).grid(row=0, column=2, padx=(6, 0))
+        ttk.Label(trajectory, text="轨迹集").grid(row=0, column=3, padx=(12, 0), sticky=tk.E)
+        ttk.Combobox(trajectory, textvariable=self.trajectory_version_var, values=TRAJECTORY_VERSIONS, state="readonly", width=5).grid(
+            row=0, column=4, padx=(4, 0), sticky=tk.W
+        )
+        ttk.Label(trajectory, text="位置 Kp").grid(row=1, column=0, pady=(7, 0), sticky=tk.W)
+        ttk.Entry(trajectory, textvariable=self.trajectory_position_kp_var, width=7).grid(row=1, column=1, pady=(7, 0), sticky=tk.W)
+        ttk.Label(trajectory, text="速度→油门 Kp").grid(row=1, column=2, pady=(7, 0), padx=(8, 0), sticky=tk.W)
+        ttk.Entry(trajectory, textvariable=self.trajectory_velocity_kp_var, width=7).grid(row=1, column=3, pady=(7, 0), sticky=tk.W)
+        ttk.Label(trajectory, text="yaw Kp").grid(row=2, column=0, pady=(4, 0), sticky=tk.W)
+        ttk.Entry(trajectory, textvariable=self.trajectory_yaw_kp_var, width=7).grid(row=2, column=1, pady=(4, 0), sticky=tk.W)
+        ttk.Label(trajectory, text="油门斜率 /s").grid(row=2, column=2, pady=(4, 0), padx=(8, 0), sticky=tk.W)
+        ttk.Entry(trajectory, textvariable=self.trajectory_slew_var, width=7).grid(row=2, column=3, pady=(4, 0), sticky=tk.W)
+        ttk.Label(trajectory, text="CSV: x_m,y_m,yaw_rad,duration_s；每行 duration_s 是从上一点到该点的设定时间。", wraplength=520).grid(
+            row=3, column=0, columnspan=4, pady=(6, 0), sticky=tk.W
+        )
+        ttk.Label(trajectory, textvariable=self.trajectory_status_var, wraplength=520).grid(
+            row=4, column=0, columnspan=4, pady=(4, 0), sticky=tk.W
+        )
+
         vision = ttk.LabelFrame(configuration_panel, text="AprilTag 25H9 相机配置", padding=8)
         vision.pack(fill=tk.X, pady=(8, 0))
         vision_controls = ttk.Frame(vision)
@@ -683,7 +738,7 @@ class TelemetryMonitorApp:
         self.camera_preview.grid(row=2, column=0, sticky=tk.NSEW)
 
         chart_frame = ttk.LabelFrame(root_frame, text="推进器转速（最近 10 秒）", padding=6)
-        chart_frame.grid(row=1, column=0, columnspan=2, sticky=tk.NSEW, pady=(8, 0))
+        chart_frame.grid(row=1, column=1, sticky=tk.NSEW, pady=(8, 0))
         chart_frame.rowconfigure(1, weight=1)
         chart_frame.columnconfigure(0, weight=1)
         axis_controls = ttk.Frame(chart_frame)
@@ -723,6 +778,8 @@ class TelemetryMonitorApp:
         if receiver is not None:
             receiver.stop()
             receiver.join(timeout=1.0)
+        if self.trajectory_follower.active:
+            self.stop_trajectory("遥测监听已停止")
         self._clear_motion()
         self.listener_status_var.set("未监听")
 
@@ -759,6 +816,8 @@ class TelemetryMonitorApp:
         self.vision_status_var.set(f"正在打开相机索引 {camera_index}…")
 
     def stop_camera(self) -> None:
+        if self.trajectory_follower.active:
+            self.stop_trajectory("AprilTag 相机已停止")
         worker = self.vision_worker
         self.vision_worker = None
         if worker is not None:
@@ -792,6 +851,106 @@ class TelemetryMonitorApp:
     def request_start_button(self) -> None:
         self.start_pulse_ticks = 1
         self.control_status_var.set("将在下一控制周期发送 startButton 1→0 脉冲")
+
+    def _tracking_settings(self) -> TrackingSettings:
+        try:
+            settings = TrackingSettings(
+                position_kp_s=float(self.trajectory_position_kp_var.get()),
+                velocity_to_throttle_kp=float(self.trajectory_velocity_kp_var.get()),
+                yaw_kp_s=float(self.trajectory_yaw_kp_var.get()),
+                output_slew_per_s=float(self.trajectory_slew_var.get()),
+            )
+            settings.validate()
+            return settings
+        except (TrajectoryError, ValueError) as error:
+            raise TrajectoryError(f"轨迹控制参数无效：{error}") from error
+
+    def _reliable_pose(self) -> PoseEstimate | None:
+        kinematics = self.vision_interpolator.latest_kinematics()
+        if kinematics is None:
+            return None
+        snapshot, x_velocity, y_velocity, yaw_rate = kinematics
+        if None in (snapshot.x_m, snapshot.y_m, snapshot.yaw_rad):
+            return None
+        # 规划闭环全部使用质量门控后的 AprilTag 位姿；下传接口仍与键盘一致。
+        return PoseEstimate(snapshot.x_m, snapshot.y_m, normalize_angle(snapshot.yaw_rad), x_velocity, y_velocity, yaw_rate)
+
+    def _selected_trajectory_directory(self) -> Path:
+        return trajectory_directory_for(self.trajectory_version_var.get())
+
+    def _recording_dataset_directory(self) -> Path:
+        if self.loaded_trajectory_path is not None:
+            return dataset_directory_for(self.loaded_trajectory_path.parent.name)
+        return dataset_directory_for(self.trajectory_version_var.get())
+
+    def choose_trajectory(self) -> None:
+        trajectory_directory = self._selected_trajectory_directory()
+        trajectory_directory.mkdir(parents=True, exist_ok=True)
+        filename = filedialog.askopenfilename(
+            title="选择轨迹 CSV",
+            initialdir=trajectory_directory,
+            filetypes=(("轨迹 CSV", "*.csv"),),
+        )
+        if not filename:
+            return
+        path = Path(filename).resolve()
+        try:
+            path.relative_to(trajectory_directory.resolve())
+        except ValueError:
+            error = TrajectoryError(f"轨迹文件必须位于 training_trajectories/{self.trajectory_version_var.get()} 文件夹内")
+            self.loaded_waypoints = None
+            self.loaded_trajectory_path = None
+            self.trajectory_status_var.set(f"轨迹加载失败：{error}")
+            messagebox.showerror("轨迹 CSV 错误", str(error))
+            return
+        try:
+            waypoints = load_waypoints(path)
+        except TrajectoryError as error:
+            self.loaded_waypoints = None
+            self.loaded_trajectory_path = None
+            self.trajectory_status_var.set(f"轨迹加载失败：{error}")
+            messagebox.showerror("轨迹 CSV 错误", str(error))
+            return
+        self.loaded_waypoints = waypoints
+        self.loaded_trajectory_path = path
+        duration_s = sum(point.duration_s for point in waypoints)
+        self.trajectory_status_var.set(f"已加载：{path.name}；{len(waypoints)} 个关键点；CSV 设定总时长 {duration_s:.1f} s；等待启动")
+
+    def start_trajectory(self) -> None:
+        if self.loaded_waypoints is None or self.loaded_trajectory_path is None:
+            messagebox.showerror("无法启动轨迹", "请先从当前轨迹集文件夹选择合法 CSV。")
+            return
+        if self.vision_worker is None:
+            messagebox.showerror("无法启动轨迹", "请先启动 AprilTag 定位。")
+            return
+        pose = self._reliable_pose()
+        if pose is None:
+            messagebox.showerror("无法启动轨迹", "需要新鲜、通过质量门控的 AprilTag XY 与 yaw 位姿。")
+            return
+        try:
+            settings = self._tracking_settings()
+            self.trajectory_follower.start(time.monotonic(), pose, self.loaded_waypoints, settings)
+        except TrajectoryError as error:
+            self.trajectory_status_var.set(f"轨迹启动失败：{error}")
+            messagebox.showerror("轨迹错误", str(error))
+            return
+        self._clear_motion()
+        self.last_tracking_command = None
+        self.trajectory_status_var.set(f"轨迹执行中：{self.loaded_trajectory_path.name}；正在返回全局原点")
+
+    def stop_trajectory(self, reason: str = "用户停止", transmit_immediately: bool = True) -> None:
+        was_active = self.trajectory_follower.active
+        self.trajectory_follower.stop()
+        self.last_tracking_command = None
+        self._clear_motion()
+        self.start_pulse_ticks = 0
+        if was_active or reason:
+            self.trajectory_status_var.set(f"轨迹已停止：{reason}")
+        if transmit_immediately:
+            try:
+                self.control_transmitter.send(build_control_frame())
+            except OSError as error:
+                self.control_status_var.set(f"控制 UDP 发送失败：{error}")
 
     def apply_y_axis_limits(self) -> None:
         try:
@@ -835,9 +994,33 @@ class TelemetryMonitorApp:
         return yaw, forward, left_right
 
     def _control_tick(self) -> None:
-        yaw, forward, left_right = self._movement_values()
+        pose = self._reliable_pose()
+        tracking = self.trajectory_follower.active
+        enable_path_tracking = 0
+        if tracking:
+            if pose is None:
+                self.stop_trajectory("AprilTag 可靠定位已失效", transmit_immediately=False)
+                yaw, forward, left_right = 0.0, 0.0, 0.0
+            else:
+                try:
+                    command = self.trajectory_follower.update(time.monotonic(), pose, self._tracking_settings())
+                except TrajectoryError as error:
+                    self.stop_trajectory(str(error), transmit_immediately=False)
+                    yaw, forward, left_right = 0.0, 0.0, 0.0
+                else:
+                    self.last_tracking_command = command
+                    yaw, forward, left_right = command.yaw_rate, command.forward_throttle, command.left_throttle
+                    reference = command.reference
+                    phase = "终点保持" if reference.complete else "轨迹执行中"
+                    self.trajectory_status_var.set(
+                        f"{phase}；参考 X={reference.x_m:+.2f} Y={reference.y_m:+.2f} yaw={reference.yaw_rad:+.2f}；"
+                        f"实际 X={pose.x_m:+.2f} Y={pose.y_m:+.2f} yaw={normalize_angle(pose.yaw_rad):+.2f}；"
+                        f"油门 F={forward:+.2f} L={left_right:+.2f} Y={yaw:+.2f}"
+                    )
+        else:
+            yaw, forward, left_right = self._movement_values()
         start_button = int(self.start_pulse_ticks > 0)
-        frame = build_control_frame(yaw, forward, left_right, start_button)
+        frame = build_control_frame(yaw, forward, left_right, start_button, enable_path_tracking)
         try:
             self.control_transmitter.send(frame)
             if start_button:
@@ -853,20 +1036,32 @@ class TelemetryMonitorApp:
     def start_recording(self) -> None:
         if self.recorder.active:
             return
-        filename = filedialog.asksaveasfilename(
-            title="保存遥测 CSV",
-            defaultextension=".csv",
-            filetypes=(("CSV 文件", "*.csv"),),
-            initialfile=f"nx_telemetry_{datetime.now():%Y%m%d_%H%M%S}.csv",
-        )
-        if not filename:
-            return
+        dataset_directory = self._recording_dataset_directory()
+        dataset_directory.mkdir(parents=True, exist_ok=True)
+        if self.loaded_trajectory_path is not None:
+            path = dataset_directory / self.loaded_trajectory_path.name
+            if path.exists() and not messagebox.askyesno(
+                "覆盖已有采集文件？",
+                f"采集文件已存在：\n{path}\n\n是否覆盖？",
+            ):
+                return
+        else:
+            filename = filedialog.asksaveasfilename(
+                title="保存遥测 CSV",
+                defaultextension=".csv",
+                filetypes=(("CSV 文件", "*.csv"),),
+                initialdir=dataset_directory,
+                initialfile=f"nx_telemetry_{datetime.now():%Y%m%d_%H%M%S}.csv",
+            )
+            if not filename:
+                return
+            path = Path(filename)
         try:
-            self.recorder.start(Path(filename))
+            self.recorder.start(path)
         except OSError as error:
             messagebox.showerror("无法开始采集", str(error))
             return
-        self.recording_var.set(f"采集中：{filename}")
+        self.recording_var.set(f"采集中：{path}")
 
     def stop_recording(self) -> None:
         was_active = self.recorder.active
@@ -951,7 +1146,8 @@ class TelemetryMonitorApp:
             from PIL import Image, ImageTk
 
             image = Image.fromarray(image_bgr[:, :, ::-1])
-            image.thumbnail((720, 405))
+            # 限制预览高度，保证右下角推进器转速图始终保留可见空间。
+            image.thumbnail((720, 300))
             self.preview_image = ImageTk.PhotoImage(image=image)
             self.camera_preview.configure(image=self.preview_image, text="")
         except Exception as error:

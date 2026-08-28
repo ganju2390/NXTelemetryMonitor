@@ -20,8 +20,10 @@ from nx_telemetry_monitor import (
     TimestampValidator,
     TimestampResult,
     build_control_frame,
+    dataset_directory_for,
     decode_packet,
     is_valid_control_frame,
+    trajectory_directory_for,
 )
 
 
@@ -44,6 +46,16 @@ def make_packet(timestamp: float = 1.0, tail: tuple[int, int, int, int] = (0, 0,
         timestamp,
         *tail,
     )
+
+
+class TrajectoryVersionTests(unittest.TestCase):
+    def test_v1_and_v2_map_to_matching_trajectory_and_dataset_directories(self) -> None:
+        self.assertEqual("v1", trajectory_directory_for("v1").name)
+        self.assertEqual("v2", trajectory_directory_for("v2").name)
+        self.assertEqual("v1", dataset_directory_for("v1").name)
+        self.assertEqual("v2", dataset_directory_for("v2").name)
+        with self.assertRaises(ValueError):
+            trajectory_directory_for("v3")
 
 
 class DecoderTests(unittest.TestCase):
@@ -90,6 +102,26 @@ class ControlFrameTests(unittest.TestCase):
         frame[8] ^= 0x01
         self.assertFalse(is_valid_control_frame(bytes(frame)))
 
+    def test_path_tracking_fields_keep_the_52_byte_contract(self) -> None:
+        frame = build_control_frame(
+            yaw_rate=-0.2,
+            forward_speed=0.4,
+            left_right_speed=-0.1,
+            enable_path_tracking=1,
+            global_x=1.0,
+            global_y=-2.0,
+            global_yaw=0.3,
+            global_x_velocity=0.1,
+            global_y_velocity=-0.2,
+            global_yaw_rate=0.05,
+        )
+        self.assertEqual(52, len(frame))
+        self.assertTrue(is_valid_control_frame(frame))
+        payload = CONTROL_PAYLOAD_STRUCT.unpack(frame[1:-2])
+        self.assertEqual(1, payload[7])
+        for actual, expected in zip(payload[10:], (1.0, -2.0, 0.3, 0.1, -0.2, 0.05)):
+            self.assertAlmostEqual(expected, actual, places=6)
+
 
 class CsvRecorderTests(unittest.TestCase):
     def test_recorder_flushes_valid_packet_to_csv(self) -> None:
@@ -123,10 +155,43 @@ class CsvRecorderTests(unittest.TestCase):
                 rows = list(csv.DictReader(csv_file))
 
         self.assertEqual(recorder.records_written, 1)
-        self.assertEqual(rows[0]["source_ip"], "192.168.1.20")
         self.assertEqual(rows[0]["int_rpm_8"], "800")
-        self.assertEqual(rows[0]["vision_valid"], "1")
-        self.assertEqual(rows[0]["vision_tag_ids"], "10 11")
+        self.assertEqual(rows[0]["firmware_timestamp"], "1.0")
+        self.assertEqual(rows[0]["tag_x_m"], "1.25")
+        self.assertEqual(rows[0]["tag_y_m"], "-0.5")
+        self.assertEqual(rows[0]["tag_yaw_rad"], "0.75")
+        self.assertEqual(rows[0]["tag_timestamp_utc"], rows[0]["received_utc"])
+        self.assertNotIn("source_ip", rows[0])
+
+    def test_recorder_accepts_reliable_slow_camera_interval(self) -> None:
+        packet = decode_packet(make_packet(), ("192.168.1.20", 6000))
+        event = PacketEvent(packet, TimestampResult(delta=None, continuous=True, missing_frames=0))
+        interpolator = VisionInterpolator()
+        for offset, x_value in ((-0.20, 2.0), (0.20, 2.2)):
+            accepted, reason = interpolator.push(
+                VisionSnapshot(
+                    valid=True,
+                    x_m=x_value,
+                    y_m=0.0,
+                    yaw_rad=0.0,
+                    tag_ids=(10,),
+                    reprojection_error_px=0.5,
+                    captured_monotonic=packet.received_monotonic + offset,
+                    captured_utc="2026-08-28T00:00:00.000+00:00",
+                    message="定位有效",
+                )
+            )
+            self.assertTrue(accepted, reason)
+        recorder = CsvRecorder(interpolator)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_path = Path(temporary_directory) / "capture.csv"
+            recorder.start(output_path)
+            recorder.record(event)
+            recorder.stop()
+            with output_path.open(encoding="utf-8-sig", newline="") as csv_file:
+                rows = list(csv.DictReader(csv_file))
+        self.assertEqual(1, recorder.records_written)
+        self.assertEqual("2.1", rows[0]["tag_x_m"])
 
 
 class AprilTagLayoutTests(unittest.TestCase):

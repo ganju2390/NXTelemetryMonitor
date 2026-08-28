@@ -26,7 +26,9 @@ VISION_STALE_SECONDS = 0.5
 MAX_CORNER_REPROJECTION_ERROR_PX = 6.0
 MAX_POSITION_SPEED_M_S = 0.8
 MAX_YAW_RATE_RAD_S = 3.0
-MAX_INTERPOLATION_GAP_SECONDS = 0.15
+# 可靠视觉帧可能因 AprilTag 求解而降至低于相机名义帧率。只要两端都通过
+# 几何与运动门控，500 ms 内的间隔仍可安全地用于 200 Hz 遥测插值。
+MAX_INTERPOLATION_GAP_SECONDS = 0.50
 
 
 @dataclass(frozen=True)
@@ -143,6 +145,31 @@ class VisionInterpolator:
             if not self._samples:
                 return None, None
             return self._samples[0].captured_monotonic, self._samples[-1].captured_monotonic
+
+    def latest_kinematics(self, now: float | None = None) -> tuple[VisionSnapshot, float, float, float] | None:
+        """Return only fresh, accepted visual data plus a derivative from accepted samples.
+
+        This is deliberately separate from CSV interpolation: real-time control must
+        never extrapolate past the latest camera observation, while CSV can wait for
+        a future bracketing frame.
+        """
+        with self._lock:
+            samples = tuple(self._samples)
+        if not samples:
+            return None
+        latest = samples[-1]
+        if not latest.is_fresh(now):
+            return None
+        if len(samples) < 2:
+            return latest, 0.0, 0.0, 0.0
+        previous = samples[-2]
+        duration = latest.captured_monotonic - previous.captured_monotonic
+        if duration <= 0.0 or duration > MAX_INTERPOLATION_GAP_SECONDS:
+            return latest, 0.0, 0.0, 0.0
+        x_velocity = (latest.x_m - previous.x_m) / duration
+        y_velocity = (latest.y_m - previous.y_m) / duration
+        yaw_rate = self._angle_difference(latest.yaw_rad, previous.yaw_rad) / duration
+        return latest, x_velocity, y_velocity, yaw_rate
 
     def interpolate(self, timestamp: float) -> VisionSnapshot | None:
         with self._lock:
