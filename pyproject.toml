@@ -1,0 +1,15 @@
+[project]
+name = "nx-telemetry-monitor"
+version = "0.1.0"
+description = "Real-time UDP telemetry monitor for the FineSUB NX uplink"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.0",
+    "opencv-contrib-python>=4.10",
+    "Pillow>=10.0",
+    "PyYAML>=6.0",
+]
+
+[tool.uv]
+package = false

@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "description": "ROV top-mounted AprilTag 25H9 layout. Body +X is forward (ID 10/13 side); body +Y is left.",
+  "marker_length_m": 0.093,
+  "outer_square_side_m": 0.26,
+  "tags": [
+    {"id": 10, "center_m": [0.0700, 0.0700], "yaw_deg": 0.0},
+    {"id": 11, "center_m": [-0.0700, 0.0700], "yaw_deg": 0.0},
+    {"id": 12, "center_m": [-0.0700, -0.0700], "yaw_deg": 0.0},
+    {"id": 13, "center_m": [0.0700, -0.0700], "yaw_deg": 0.0}
+  ]
+}
