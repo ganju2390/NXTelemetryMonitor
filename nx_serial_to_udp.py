@@ -28,7 +28,7 @@ BAUD_RATES = {
     921600: termios.B921600,
 }
 
-FRAME_SIZE = 48
+FRAME_SIZE = 40
 FRAME_TAIL = b"\x00\x00\x80\x7F"
 
 
@@ -90,7 +90,7 @@ def forward_serial_to_udp(device: str, baud: int, destination_ip: str, destinati
                         forwarded_bytes += frame_size
                     else:
                         # UART has no packet boundary. Drop one byte and try the next
-                        # 48-byte window, which re-synchronizes on the fixed tail.
+                        # fixed-size window, which re-synchronizes on the fixed tail.
                         del buffer[0]
                         rejected_candidates += 1
 

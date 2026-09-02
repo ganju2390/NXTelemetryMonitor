@@ -1,7 +1,7 @@
 """FineSUB NX UDP telemetry monitor.
 
 The wire contract mirrors the packed V5_SUB::UploadData structure:
-<6f8hf4B (48 bytes, little-endian).
+<9f4B (40 bytes, little-endian).
 """
 
 from __future__ import annotations
@@ -40,11 +40,9 @@ from trajectory_tracking import (
 )
 
 
-PACKET_STRUCT = struct.Struct("<6f8hf4B")
+PACKET_STRUCT = struct.Struct("<9f4B")
 PACKET_SIZE = PACKET_STRUCT.size
 PACKET_TAIL = (0x00, 0x00, 0x80, 0x7F)
-EXPECTED_TIMESTAMP_STEP = 0.005
-TIMESTAMP_TOLERANCE = 0.0005
 CHART_HISTORY_SECONDS = 10.0
 MAX_DRAW_SAMPLES = 400
 CONTROL_HEADER = 0xAA
@@ -130,14 +128,15 @@ def is_valid_control_frame(frame: bytes) -> bool:
 
 @dataclass(frozen=True)
 class TelemetryPacket:
-    pressure: float
-    acc_x: float
-    acc_y: float
-    acc_z: float
-    gyro_z: float
-    yaw: float
-    rpms: tuple[int, int, int, int, int, int, int, int]
-    timestamp: float
+    odom_global_x_velocity: float
+    odom_global_y_velocity: float
+    odom_global_yaw_rate: float
+    odom_global_x: float
+    odom_global_y: float
+    odom_global_yaw: float
+    network_body_x_velocity: float
+    network_body_y_velocity: float
+    network_body_yaw_rate: float
     source_ip: str
     source_port: int
     received_monotonic: float
@@ -145,20 +144,12 @@ class TelemetryPacket:
 
 
 @dataclass(frozen=True)
-class TimestampResult:
-    delta: float | None
-    continuous: bool
-    missing_frames: int
-
-
-@dataclass(frozen=True)
 class PacketEvent:
     packet: TelemetryPacket
-    timestamp_result: TimestampResult
 
 
 def decode_packet(data: bytes, source: tuple[str, int]) -> TelemetryPacket:
-    """Decode and validate one raw 48-byte UploadData UDP payload."""
+    """Decode and validate one raw 40-byte UploadData UDP payload."""
     if len(data) != PACKET_SIZE:
         raise PacketError(f"packet length is {len(data)}, expected {PACKET_SIZE}")
 
@@ -167,46 +158,20 @@ def decode_packet(data: bytes, source: tuple[str, int]) -> TelemetryPacket:
         raise PacketError("packet tail is invalid")
 
     return TelemetryPacket(
-        pressure=unpacked[0],
-        acc_x=unpacked[1],
-        acc_y=unpacked[2],
-        acc_z=unpacked[3],
-        gyro_z=unpacked[4],
-        yaw=unpacked[5],
-        rpms=tuple(unpacked[6:14]),  # type: ignore[arg-type]
-        timestamp=unpacked[14],
+        odom_global_x_velocity=unpacked[0],
+        odom_global_y_velocity=unpacked[1],
+        odom_global_yaw_rate=unpacked[2],
+        odom_global_x=unpacked[3],
+        odom_global_y=unpacked[4],
+        odom_global_yaw=unpacked[5],
+        network_body_x_velocity=unpacked[6],
+        network_body_y_velocity=unpacked[7],
+        network_body_yaw_rate=unpacked[8],
         source_ip=source[0],
         source_port=source[1],
         received_monotonic=time.monotonic(),
         received_utc=datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
     )
-
-
-class TimestampValidator:
-    """Checks the firmware timestamp sequence without losing reset information."""
-
-    def __init__(self) -> None:
-        self._last_timestamp: float | None = None
-
-    def reset(self) -> None:
-        self._last_timestamp = None
-
-    def check(self, timestamp: float) -> TimestampResult:
-        if self._last_timestamp is None:
-            self._last_timestamp = timestamp
-            return TimestampResult(delta=None, continuous=True, missing_frames=0)
-
-        delta = timestamp - self._last_timestamp
-        self._last_timestamp = timestamp
-        continuous = abs(delta - EXPECTED_TIMESTAMP_STEP) <= TIMESTAMP_TOLERANCE
-        missing_frames = 0
-
-        if delta > EXPECTED_TIMESTAMP_STEP + TIMESTAMP_TOLERANCE:
-            steps = round(delta / EXPECTED_TIMESTAMP_STEP)
-            if steps >= 2 and abs(delta - steps * EXPECTED_TIMESTAMP_STEP) <= steps * TIMESTAMP_TOLERANCE:
-                missing_frames = steps - 1
-
-        return TimestampResult(delta=delta, continuous=continuous, missing_frames=missing_frames)
 
 
 class ReceiverStats:
@@ -251,7 +216,6 @@ class UDPReceiver(threading.Thread):
         self._on_event = on_event
         self._stats = stats
         self._stop_event = threading.Event()
-        self._validator = TimestampValidator()
         self.bind_error: OSError | None = None
 
     def stop(self) -> None:
@@ -284,7 +248,7 @@ class UDPReceiver(threading.Thread):
                         self._stats.record_invalid(error, data)
                         continue
 
-                    event = PacketEvent(packet, self._validator.check(packet.timestamp))
+                    event = PacketEvent(packet)
                     self._stats.add("accepted")
                     self._on_event(event)
                     try:
@@ -317,14 +281,15 @@ class CsvRecorder:
 
     FIELDNAMES = [
         "received_utc",
-        "pressure",
-        "acc_x",
-        "acc_y",
-        "acc_z",
-        "gyro_z",
-        "yaw",
-        *(f"int_rpm_{index}" for index in range(1, 9)),
-        "firmware_timestamp",
+        "odom_global_x_velocity_m_s",
+        "odom_global_y_velocity_m_s",
+        "odom_global_yaw_rate_rad_s",
+        "odom_global_x_m",
+        "odom_global_y_m",
+        "odom_global_yaw_rad",
+        "network_body_x_velocity_m_s",
+        "network_body_y_velocity_m_s",
+        "network_body_yaw_rate_rad_s",
         "tag_timestamp_utc",
         "tag_x_m",
         "tag_y_m",
@@ -424,14 +389,15 @@ class CsvRecorder:
                         writer.writerow(
                             {
                                 "received_utc": packet.received_utc,
-                                "pressure": packet.pressure,
-                                "acc_x": packet.acc_x,
-                                "acc_y": packet.acc_y,
-                                "acc_z": packet.acc_z,
-                                "gyro_z": packet.gyro_z,
-                                "yaw": packet.yaw,
-                                **{f"int_rpm_{index}": rpm for index, rpm in enumerate(packet.rpms, start=1)},
-                                "firmware_timestamp": packet.timestamp,
+                                "odom_global_x_velocity_m_s": packet.odom_global_x_velocity,
+                                "odom_global_y_velocity_m_s": packet.odom_global_y_velocity,
+                                "odom_global_yaw_rate_rad_s": packet.odom_global_yaw_rate,
+                                "odom_global_x_m": packet.odom_global_x,
+                                "odom_global_y_m": packet.odom_global_y,
+                                "odom_global_yaw_rad": packet.odom_global_yaw,
+                                "network_body_x_velocity_m_s": packet.network_body_x_velocity,
+                                "network_body_y_velocity_m_s": packet.network_body_y_velocity,
+                                "network_body_yaw_rate_rad_s": packet.network_body_yaw_rate,
                                 # 插值定位与此 NX 遥测同一主机时刻对齐。
                                 "tag_timestamp_utc": packet.received_utc,
                                 "tag_x_m": vision.x_m,
@@ -560,7 +526,8 @@ def scan_camera_indices(result_queue: queue.Queue[tuple[int, ...]], max_index: i
 
 
 class TelemetryMonitorApp:
-    COLORS = ("#00a8ff", "#fbc531", "#4cd137", "#e84118", "#9c88ff", "#00cec9", "#e17055", "#f368e0")
+    COLORS = ("#00a8ff", "#fbc531", "#4cd137", "#9c88ff", "#00cec9", "#e17055")
+    VELOCITY_LABELS = ("Odom Vx", "Odom Vy", "Odom Wz", "Net Vx", "Net Vy", "Net Wz")
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -586,10 +553,7 @@ class TelemetryMonitorApp:
         self.held_keys: set[str] = set()
         self.start_pulse_ticks = 0
         self.packet_times: deque[float] = deque()
-        self.chart_samples: deque[tuple[float, tuple[int, ...]]] = deque(maxlen=2400)
-        self.timestamp_errors = 0
-        self.missing_frames = 0
-        self.last_delta: float | None = None
+        self.chart_samples: deque[tuple[float, tuple[float, ...]]] = deque(maxlen=2400)
 
         self.source_ip_var = tk.StringVar(value="192.168.0.2")
         self.port_var = tk.StringVar(value="54321")
@@ -602,17 +566,17 @@ class TelemetryMonitorApp:
         self.trajectory_yaw_kp_var = tk.StringVar(value="0.50")
         self.trajectory_slew_var = tk.StringVar(value="1.00")
         self.trajectory_version_var = tk.StringVar(value="v2")
-        self.y_axis_min_var = tk.StringVar(value="-3000")
-        self.y_axis_max_var = tk.StringVar(value="3000")
-        self.chart_y_min = -3000.0
-        self.chart_y_max = 3000.0
+        self.y_axis_min_var = tk.StringVar(value="-1")
+        self.y_axis_max_var = tk.StringVar(value="1")
+        self.chart_y_min = -1.0
+        self.chart_y_max = 1.0
         self.camera_index_var = tk.StringVar(value="4")
         self.listener_status_var = tk.StringVar(value="未监听")
         self.rate_var = tk.StringVar(value="0.0 Hz")
         self.timestamp_var = tk.StringVar(value="等待有效数据")
         self.packet_var = tk.StringVar(value="有效 0 / 无效 0 / 过滤 0 / UI 队列丢弃 0")
         self.invalid_detail_var = tk.StringVar(value="最近无效包：--")
-        self.latest_var = tk.StringVar(value="压力: --   Yaw: --")
+        self.latest_var = tk.StringVar(value="里程计全局位置: X=--  Y=--  yaw=--")
         self.recording_var = tk.StringVar(value="未采集")
         self.control_status_var = tk.StringVar(value="控制目标：192.168.0.2:54322；键盘未按下")
         self.trajectory_status_var = tk.StringVar(value="轨迹：未加载；手动控制")
@@ -765,9 +729,6 @@ class TelemetryMonitorApp:
         self.events = queue.Queue(maxsize=5000)
         self.packet_times.clear()
         self.chart_samples.clear()
-        self.timestamp_errors = 0
-        self.missing_frames = 0
-        self.last_delta = None
         self.receiver = UDPReceiver(port, self.source_ip_var.get(), self.events, self._record_telemetry_event, self.stats)
         self.receiver.start()
         self.listener_status_var.set(f"监听中：0.0.0.0:{port}，发送方过滤：{self.source_ip_var.get().strip() or '关闭'}")
@@ -1020,7 +981,25 @@ class TelemetryMonitorApp:
         else:
             yaw, forward, left_right = self._movement_values()
         start_button = int(self.start_pulse_ticks > 0)
-        frame = build_control_frame(yaw, forward, left_right, start_button, enable_path_tracking)
+        pose_fields = {}
+        if pose is not None:
+            # Only quality-gated, fresh AprilTag data is forwarded to the A board.
+            pose_fields = {
+                "global_x": pose.x_m,
+                "global_y": pose.y_m,
+                "global_yaw": pose.yaw_rad,
+                "global_x_velocity": pose.x_velocity_m_s,
+                "global_y_velocity": pose.y_velocity_m_s,
+                "global_yaw_rate": pose.yaw_rate_rad_s,
+            }
+        frame = build_control_frame(
+            yaw_rate=yaw,
+            forward_speed=forward,
+            left_right_speed=left_right,
+            start_button=start_button,
+            enable_path_tracking=enable_path_tracking,
+            **pose_fields,
+        )
         try:
             self.control_transmitter.send(frame)
             if start_button:
@@ -1155,20 +1134,25 @@ class TelemetryMonitorApp:
 
     def _consume_event(self, event: PacketEvent) -> None:
         packet = event.packet
-        result = event.timestamp_result
         self.packet_times.append(packet.received_monotonic)
-        self.chart_samples.append((packet.received_monotonic, packet.rpms))
-        self.last_delta = result.delta
-        if not result.continuous:
-            self.timestamp_errors += 1
-        self.missing_frames += result.missing_frames
-
-        delta_text = "首包" if result.delta is None else f"Δt={result.delta:.6f} s"
-        state_text = "连续" if result.continuous else "异常"
+        self.chart_samples.append((
+            packet.received_monotonic,
+            (
+                packet.odom_global_x_velocity,
+                packet.odom_global_y_velocity,
+                packet.odom_global_yaw_rate,
+                packet.network_body_x_velocity,
+                packet.network_body_y_velocity,
+                packet.network_body_yaw_rate,
+            ),
+        ))
         self.timestamp_var.set(
-            f"时间戳：{state_text}，{delta_text}，异常 {self.timestamp_errors}，推断丢帧 {self.missing_frames}"
+            f"上位机接收时间：{packet.received_utc}（回传协议不包含固件时间戳）"
         )
-        self.latest_var.set(f"压力: {packet.pressure:.3f}   Yaw: {packet.yaw:.3f}   最新固件时间: {packet.timestamp:.3f} s")
+        self.latest_var.set(
+            f"里程计全局位置: X={packet.odom_global_x:+.3f} m  Y={packet.odom_global_y:+.3f} m  "
+            f"yaw={packet.odom_global_yaw:+.3f} rad"
+        )
 
     def _draw_chart(self) -> None:
         canvas = self.chart
@@ -1181,7 +1165,7 @@ class TelemetryMonitorApp:
         margin_left, margin_right, margin_top, margin_bottom = 64, 18, 30, 40
         plot_width = max(1, width - margin_left - margin_right)
         plot_height = max(1, height - margin_top - margin_bottom)
-        canvas.create_text(margin_left, 12, anchor=tk.W, fill="#dcdde1", text="RPM1–RPM8（共享纵轴）")
+        canvas.create_text(margin_left, 12, anchor=tk.W, fill="#dcdde1", text="里程计/网络预测速度（共享纵轴）")
 
         if not self.chart_samples:
             canvas.create_text(width / 2, height / 2, fill="#7f8c8d", text="等待有效 UDP 遥测数据")
@@ -1205,17 +1189,17 @@ class TelemetryMonitorApp:
 
         stride = max(1, (len(visible) + MAX_DRAW_SAMPLES - 1) // MAX_DRAW_SAMPLES)
         sampled = visible[::stride]
-        for motor_index, color in enumerate(self.COLORS):
+        for velocity_index, color in enumerate(self.COLORS):
             points: list[float] = []
-            for sample_time, rpms in sampled:
+            for sample_time, velocities in sampled:
                 x = margin_left + (sample_time - (latest_time - CHART_HISTORY_SECONDS)) / CHART_HISTORY_SECONDS * plot_width
-                y = margin_top + (maximum - rpms[motor_index]) / (maximum - minimum) * plot_height
+                y = margin_top + (maximum - velocities[velocity_index]) / (maximum - minimum) * plot_height
                 points.extend((x, y))
             if len(points) >= 4:
                 canvas.create_line(*points, fill=color, width=1.5, smooth=False)
-            legend_x = margin_left + motor_index * 72
+            legend_x = margin_left + velocity_index * 90
             canvas.create_rectangle(legend_x, height - 19, legend_x + 10, height - 9, fill=color, outline=color)
-            canvas.create_text(legend_x + 14, height - 14, anchor=tk.W, fill="#dcdde1", text=f"RPM{motor_index + 1}")
+            canvas.create_text(legend_x + 14, height - 14, anchor=tk.W, fill="#dcdde1", text=self.VELOCITY_LABELS[velocity_index])
 
     def close(self) -> None:
         self._clear_motion()

@@ -12,13 +12,10 @@ from nx_telemetry_monitor import (
     CONTROL_FRAME_SIZE,
     CONTROL_PAYLOAD_STRUCT,
     CsvRecorder,
-    EXPECTED_TIMESTAMP_STEP,
     PACKET_SIZE,
     PACKET_STRUCT,
     PacketEvent,
     PacketError,
-    TimestampValidator,
-    TimestampResult,
     build_control_frame,
     dataset_directory_for,
     decode_packet,
@@ -27,23 +24,17 @@ from nx_telemetry_monitor import (
 )
 
 
-def make_packet(timestamp: float = 1.0, tail: tuple[int, int, int, int] = (0, 0, 128, 127)) -> bytes:
+def make_packet(tail: tuple[int, int, int, int] = (0, 0, 128, 127)) -> bytes:
     return PACKET_STRUCT.pack(
-        1.2,
         0.1,
         0.2,
         0.3,
-        0.4,
+        1.2,
+        -0.4,
         0.5,
-        100,
-        200,
-        300,
-        400,
-        500,
-        600,
-        700,
-        800,
-        timestamp,
+        0.6,
+        0.7,
+        0.8,
         *tail,
     )
 
@@ -59,10 +50,18 @@ class TrajectoryVersionTests(unittest.TestCase):
 
 
 class DecoderTests(unittest.TestCase):
-    def test_valid_packet_decodes_all_motor_speeds(self) -> None:
+    def test_valid_packet_decodes_nine_prediction_values(self) -> None:
         packet = decode_packet(make_packet(), ("192.168.1.20", 6000))
-        self.assertEqual(PACKET_SIZE, 48)
-        self.assertEqual(packet.rpms, (100, 200, 300, 400, 500, 600, 700, 800))
+        self.assertEqual(PACKET_SIZE, 40)
+        self.assertAlmostEqual(packet.odom_global_x_velocity, 0.1)
+        self.assertAlmostEqual(packet.odom_global_y_velocity, 0.2)
+        self.assertAlmostEqual(packet.odom_global_yaw_rate, 0.3)
+        self.assertAlmostEqual(packet.odom_global_x, 1.2)
+        self.assertAlmostEqual(packet.odom_global_y, -0.4)
+        self.assertAlmostEqual(packet.odom_global_yaw, 0.5)
+        self.assertAlmostEqual(packet.network_body_x_velocity, 0.6)
+        self.assertAlmostEqual(packet.network_body_y_velocity, 0.7)
+        self.assertAlmostEqual(packet.network_body_yaw_rate, 0.8)
         self.assertEqual(packet.source_ip, "192.168.1.20")
 
     def test_rejects_wrong_length_and_tail(self) -> None:
@@ -70,17 +69,6 @@ class DecoderTests(unittest.TestCase):
             decode_packet(b"\x00" * (PACKET_SIZE - 1), ("127.0.0.1", 1))
         with self.assertRaises(PacketError):
             decode_packet(make_packet(tail=(1, 2, 3, 4)), ("127.0.0.1", 1))
-
-
-class TimestampTests(unittest.TestCase):
-    def test_continuous_packet_and_missing_frame(self) -> None:
-        validator = TimestampValidator()
-        self.assertTrue(validator.check(1.0).continuous)
-        next_result = validator.check(1.0 + EXPECTED_TIMESTAMP_STEP)
-        self.assertTrue(next_result.continuous)
-        missed_result = validator.check(1.0 + 3 * EXPECTED_TIMESTAMP_STEP)
-        self.assertFalse(missed_result.continuous)
-        self.assertEqual(missed_result.missing_frames, 1)
 
 
 class ControlFrameTests(unittest.TestCase):
@@ -126,7 +114,7 @@ class ControlFrameTests(unittest.TestCase):
 class CsvRecorderTests(unittest.TestCase):
     def test_recorder_flushes_valid_packet_to_csv(self) -> None:
         packet = decode_packet(make_packet(), ("192.168.1.20", 6000))
-        event = PacketEvent(packet, TimestampResult(delta=None, continuous=True, missing_frames=0))
+        event = PacketEvent(packet)
         interpolator = VisionInterpolator()
         for offset, x_value in ((-0.05, 1.24), (0.05, 1.26)):
             accepted, reason = interpolator.push(
@@ -155,8 +143,8 @@ class CsvRecorderTests(unittest.TestCase):
                 rows = list(csv.DictReader(csv_file))
 
         self.assertEqual(recorder.records_written, 1)
-        self.assertEqual(rows[0]["int_rpm_8"], "800")
-        self.assertEqual(rows[0]["firmware_timestamp"], "1.0")
+        self.assertEqual(rows[0]["odom_global_x_m"], "1.2000000476837158")
+        self.assertEqual(rows[0]["network_body_yaw_rate_rad_s"], "0.800000011920929")
         self.assertEqual(rows[0]["tag_x_m"], "1.25")
         self.assertEqual(rows[0]["tag_y_m"], "-0.5")
         self.assertEqual(rows[0]["tag_yaw_rad"], "0.75")
@@ -165,7 +153,7 @@ class CsvRecorderTests(unittest.TestCase):
 
     def test_recorder_accepts_reliable_slow_camera_interval(self) -> None:
         packet = decode_packet(make_packet(), ("192.168.1.20", 6000))
-        event = PacketEvent(packet, TimestampResult(delta=None, continuous=True, missing_frames=0))
+        event = PacketEvent(packet)
         interpolator = VisionInterpolator()
         for offset, x_value in ((-0.20, 2.0), (0.20, 2.2)):
             accepted, reason = interpolator.push(

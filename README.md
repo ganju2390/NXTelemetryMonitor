@@ -24,22 +24,22 @@ uv run python nx_telemetry_monitor.py
 
 ## 固件数据协议
 
-UDP datagram 必须原样承载 `V5_SUB::UploadData`，共 48 字节、小端、紧凑布局：
+UDP datagram 必须原样承载 `V5_SUB::UploadData`，共 40 字节、小端、紧凑布局：
 
 | 字节范围 | 字段 |
 | --- | --- |
-| 0–23 | `float pressure, accX, accY, accZ, gyroZ, yaw` |
-| 24–39 | `int16_t intRpm1` 到 `int16_t intRpm8` |
-| 40–43 | `float timeStamp` |
-| 44–47 | 尾标 `00 00 80 7F` |
+| 0–11 | `float odomGlobalXVelocity, odomGlobalYVelocity, odomGlobalYawRate` |
+| 12–23 | `float odomGlobalX, odomGlobalY, odomGlobalYaw` |
+| 24–35 | `float networkBodyXVelocity, networkBodyYVelocity, networkBodyYawRate` |
+| 36–39 | 尾标 `00 00 80 7F` |
 
-时间戳期望相邻数据包增加 `0.005 s`。程序以 `±0.0005 s` 判定连续性，并统计异常和推断丢帧数。
+该回传协议不包含固件时间戳；上位机以本机 `received_utc` 记录每个 UDP 包的接收时间。
 
 ## CSV 采集
 
-点击“开始采集”选择保存路径。CSV 使用 UTF-8 BOM，仅记录 NX 遥测数据（压力、IMU、8 路 RPM、固件时间戳）与 AprilTag 定位数据。
+点击“开始采集”选择保存路径。CSV 使用 UTF-8 BOM，仅记录九项里程计/网络预测遥测与 AprilTag 定位数据。
 
-每条写入行含 `received_utc`、`firmware_timestamp`、`tag_timestamp_utc`、`tag_x_m`、`tag_y_m`、`tag_yaw_rad`；Tag 位姿按同一条 NX 遥测的主机接收时刻插值对齐。来源地址、连续性诊断、Tag ID、重投影误差与状态等调试字段不会写入 CSV。
+每条写入行含 `received_utc`、九项预测值、`tag_timestamp_utc`、`tag_x_m`、`tag_y_m`、`tag_yaw_rad`；Tag 位姿按同一条 NX 遥测的主机接收时刻插值对齐。来源地址、Tag ID、重投影误差与状态等调试字段不会写入 CSV。
 
 ## AprilTag 全局定位
 
@@ -47,7 +47,7 @@ UDP datagram 必须原样承载 `V5_SUB::UploadData`，共 48 字节、小端、
 
 - 相机内参：`D:\fins\tools\finsrov_perception\calibration\rgb_camera.yaml`，只接受对应的 **1280×720** 图像，避免未标定缩放引入尺度错误。
 - Tag 几何：`apriltag_layout.json`。黑色边框间距为 **0.093 m**；相邻 Tag 的中心距为 **0.140 m**。ID 10、13 一侧为 ROV 前方。
-- 坐标：相机参考系投影到 Tag 平面，`+X` 向画面右、`+Y` 向画面上，yaw 从 `+X` 逆时针为正。定位只显示和写入 CSV，不会写入 A 板的 52 字节控制帧。
+- 坐标：相机参考系投影到 Tag 平面，`+X` 向画面右、`+Y` 向画面上，yaw 从 `+X` 逆时针为正。通过质量门控的定位会同时写入 CSV 和 A 板的 52 字节控制帧。
 
 若实际打印的 Tag 朝向不同，可在 `apriltag_layout.json` 中调整各 ID 的 `yaw_deg`；此值定义该 Tag 印刷顶部相对于 ROV 前方的方向。
 
