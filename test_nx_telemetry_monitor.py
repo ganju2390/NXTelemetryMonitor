@@ -73,7 +73,13 @@ class DecoderTests(unittest.TestCase):
 
 class ControlFrameTests(unittest.TestCase):
     def test_control_frame_matches_streamer_layout(self) -> None:
-        frame = build_control_frame(yaw_rate=0.25, forward_speed=0.5, left_right_speed=-0.75, start_button=1)
+        frame = build_control_frame(
+            yaw_rate=0.25,
+            forward_speed=0.5,
+            left_right_speed=-0.75,
+            start_button=1,
+            reset_io=1,
+        )
         self.assertEqual(len(frame), CONTROL_FRAME_SIZE)
         self.assertTrue(is_valid_control_frame(frame))
 
@@ -82,7 +88,7 @@ class ControlFrameTests(unittest.TestCase):
         self.assertAlmostEqual(payload[1], 0.5)
         self.assertAlmostEqual(payload[2], -0.75)
         self.assertEqual(payload[5], 1)
-        self.assertEqual(payload[6:10], (0, 0, 0, 0))
+        self.assertEqual(payload[6:10], (1, 0, 0, 0))
         self.assertEqual(payload[10:], (0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
 
     def test_control_frame_rejects_crc_damage(self) -> None:

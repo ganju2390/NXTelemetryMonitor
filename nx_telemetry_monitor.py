@@ -55,7 +55,13 @@ CAMERA_CALIBRATION_PATH = PERCEPTION_ROOT / "calibration" / "rgb_camera.yaml"
 TAG_LAYOUT_PATH = Path(__file__).with_name("apriltag_layout.json")
 TRAJECTORY_ROOT = Path(__file__).with_name("training_trajectories")
 DATASET_ROOT = Path(__file__).with_name("dataset")
+VIDEO_ROOT = Path(__file__).with_name("videos")
 TRAJECTORY_VERSIONS = ("v2", "v1")
+CAMERA_CAPTURE_WIDTH = 1920
+CAMERA_CAPTURE_HEIGHT = 1080
+CAMERA_CAPTURE_FPS = 30.0
+LOCALISATION_WIDTH = 1280
+LOCALISATION_HEIGHT = 720
 
 
 def trajectory_directory_for(version: str) -> Path:
@@ -89,6 +95,7 @@ def build_control_frame(
     forward_speed: float = 0.0,
     left_right_speed: float = 0.0,
     start_button: int = 0,
+    reset_io: int = 0,
     enable_path_tracking: int = 0,
     global_x: float = 0.0,
     global_y: float = 0.0,
@@ -105,7 +112,7 @@ def build_control_frame(
         0.0,  # downSpeed
         0.0,  # upSpeed
         start_button,
-        0,  # fillLight
+        reset_io,
         enable_path_tracking,
         0,  # camYaw
         0,  # camPitch
@@ -430,9 +437,98 @@ class CameraLocalisationWorker(threading.Thread):
         self._snapshot_lock = threading.Lock()
         self._latest_snapshot = VisionSnapshot.unavailable("相机尚未启动")
         self._interpolator = interpolator
+        self._recording_lock = threading.Lock()
+        self._recording_request: Path | None = None
+        self._recording_stop_requested = False
+        self._active_recording_path: Path | None = None
+        self._recording_status = "视频录制：未开始"
 
     def stop(self) -> None:
         self._stop_event.set()
+
+    def start_recording(self, path: Path) -> None:
+        """Request recording from the camera-owning thread on its next frame."""
+        with self._recording_lock:
+            self._recording_request = path
+            self._recording_stop_requested = False
+            self._recording_status = "视频录制：等待 1080P 相机帧…"
+
+    def stop_recording(self) -> None:
+        with self._recording_lock:
+            self._recording_request = None
+            self._recording_stop_requested = True
+            if self._active_recording_path is None:
+                self._recording_status = "视频录制：已停止"
+            else:
+                self._recording_status = "视频录制：正在停止并保存文件…"
+
+    def recording_status(self) -> str:
+        with self._recording_lock:
+            return self._recording_status
+
+    def _stop_video_writer(self, writer: object | None, message: str) -> None:
+        if writer is not None:
+            writer.release()
+        with self._recording_lock:
+            self._recording_request = None
+            self._recording_stop_requested = False
+            self._active_recording_path = None
+            self._recording_status = message
+
+    def _write_video_frame(self, cv2: object, writer: object | None, image_bgr: object) -> object | None:
+        """Open/write/release VideoWriter only from this camera thread."""
+        with self._recording_lock:
+            requested_path = self._recording_request
+            stop_requested = self._recording_stop_requested
+
+        if stop_requested:
+            previous_name = self._active_recording_path.name if self._active_recording_path is not None else ""
+            suffix = f"：{previous_name}" if previous_name else ""
+            self._stop_video_writer(writer, f"视频录制已停止{suffix}")
+            return None
+
+        if writer is None and requested_path is not None:
+            height, width = image_bgr.shape[:2]
+            if (width, height) != (CAMERA_CAPTURE_WIDTH, CAMERA_CAPTURE_HEIGHT):
+                with self._recording_lock:
+                    self._recording_request = None
+                    self._recording_status = (
+                        f"视频录制未启动：相机实际输出 {width}×{height}，需要 "
+                        f"{CAMERA_CAPTURE_WIDTH}×{CAMERA_CAPTURE_HEIGHT}"
+                    )
+                return None
+            try:
+                requested_path.parent.mkdir(parents=True, exist_ok=True)
+                candidate = cv2.VideoWriter(
+                    str(requested_path),
+                    cv2.VideoWriter_fourcc(*"mp4v"),
+                    CAMERA_CAPTURE_FPS,
+                    (CAMERA_CAPTURE_WIDTH, CAMERA_CAPTURE_HEIGHT),
+                )
+            except Exception as error:
+                with self._recording_lock:
+                    self._recording_request = None
+                    self._recording_status = f"视频录制未启动：无法创建文件（{error}）"
+                return None
+            if not candidate.isOpened():
+                candidate.release()
+                with self._recording_lock:
+                    self._recording_request = None
+                    self._recording_status = "视频录制未启动：OpenCV 无法创建 MP4 编码器"
+                return None
+            writer = candidate
+            with self._recording_lock:
+                self._recording_request = None
+                self._active_recording_path = requested_path
+                self._recording_status = f"视频录制中：{requested_path.name}（1920×1080 @ 30 FPS）"
+
+        if writer is not None:
+            try:
+                writer.write(image_bgr)
+            except Exception as error:
+                self._stop_video_writer(writer, f"视频录制已停止：写入失败（{error}）")
+                return None
+        return writer
 
     def latest_snapshot(self) -> VisionSnapshot:
         with self._snapshot_lock:
@@ -453,6 +549,7 @@ class CameraLocalisationWorker(threading.Thread):
 
     def run(self) -> None:
         capture = None
+        writer = None
         try:
             import cv2
 
@@ -467,9 +564,12 @@ class CameraLocalisationWorker(threading.Thread):
             if not capture.isOpened():
                 self._publish(VisionFrame(VisionSnapshot.unavailable(f"无法打开相机索引 {self._camera_index}"), None))
                 return
-            capture.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-            capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-            capture.set(cv2.CAP_PROP_FPS, 30)
+            # Record the original 1080P image.  AprilTag is processed from a
+            # 1280x720 derivative so its existing calibration remains valid.
+            capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+            capture.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_CAPTURE_WIDTH)
+            capture.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_CAPTURE_HEIGHT)
+            capture.set(cv2.CAP_PROP_FPS, CAMERA_CAPTURE_FPS)
 
             while not self._stop_event.is_set():
                 ok, image_bgr = capture.read()
@@ -477,7 +577,13 @@ class CameraLocalisationWorker(threading.Thread):
                     self._publish(VisionFrame(VisionSnapshot.unavailable("相机读帧失败"), None))
                     time.sleep(0.05)
                     continue
-                frame = localizer.detect(image_bgr)
+                writer = self._write_video_frame(cv2, writer, image_bgr)
+                localisation_image = cv2.resize(
+                    image_bgr,
+                    (LOCALISATION_WIDTH, LOCALISATION_HEIGHT),
+                    interpolation=cv2.INTER_AREA,
+                )
+                frame = localizer.detect(localisation_image)
                 accepted, reason = self._interpolator.push(frame.snapshot)
                 if not accepted and frame.snapshot.valid:
                     frame = VisionFrame(
@@ -491,6 +597,8 @@ class CameraLocalisationWorker(threading.Thread):
         except Exception as error:
             self._publish(VisionFrame(VisionSnapshot.unavailable(f"视觉定位不可用：{error}"), None))
         finally:
+            if writer is not None:
+                self._stop_video_writer(writer, "视频录制已停止：相机已关闭")
             if capture is not None:
                 capture.release()
 
@@ -526,8 +634,32 @@ def scan_camera_indices(result_queue: queue.Queue[tuple[int, ...]], max_index: i
 
 
 class TelemetryMonitorApp:
-    COLORS = ("#00a8ff", "#fbc531", "#4cd137", "#9c88ff", "#00cec9", "#e17055")
-    VELOCITY_LABELS = ("Odom Vx", "Odom Vy", "Odom Wz", "Net Vx", "Net Vy", "Net Wz")
+    CHART_GROUPS = (
+        (
+            "ESKF 全局速度",
+            (
+                ("ESKF Vx（m/s）", 0, "#00a8ff"),
+                ("ESKF Vy（m/s）", 1, "#fbc531"),
+                ("ESKF Wz（rad/s）", 2, "#4cd137"),
+            ),
+        ),
+        (
+            "ESKF 全局位姿",
+            (
+                ("ESKF X（m）", 3, "#9c88ff"),
+                ("ESKF Y（m）", 4, "#00cec9"),
+                ("ESKF yaw（rad）", 5, "#e17055"),
+            ),
+        ),
+        (
+            "V24 机身速度",
+            (
+                ("V24 Vx（m/s）", 6, "#e84118"),
+                ("V24 Vy（m/s）", 7, "#8c7ae6"),
+                ("V24 Wz（rad/s）", 8, "#e1b12c"),
+            ),
+        ),
+    )
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -552,8 +684,10 @@ class TelemetryMonitorApp:
         self.preview_image: object | None = None
         self.held_keys: set[str] = set()
         self.start_pulse_ticks = 0
+        self.reset_io_pulse_ticks = 0
         self.packet_times: deque[float] = deque()
         self.chart_samples: deque[tuple[float, tuple[float, ...]]] = deque(maxlen=2400)
+        self.chart_group_index = 0
 
         self.source_ip_var = tk.StringVar(value="192.168.0.2")
         self.port_var = tk.StringVar(value="54321")
@@ -582,6 +716,7 @@ class TelemetryMonitorApp:
         self.trajectory_status_var = tk.StringVar(value="轨迹：未加载；手动控制")
         self.vision_status_var = tk.StringVar(value="视觉定位：相机未启动")
         self.vision_pose_var = tk.StringVar(value="全局（相机坐标）X: --   Y: --   yaw: --")
+        self.video_recording_var = tk.StringVar(value="视频录制：未开始")
 
         self._create_widgets()
         self.root.bind_all("<KeyPress>", self._on_key_press)
@@ -631,6 +766,7 @@ class TelemetryMonitorApp:
         ttk.Entry(control, textvariable=self.control_port_var, width=8).grid(row=0, column=3, padx=6)
         ttk.Button(control, text="应用控制目标", command=self.apply_control_destination).grid(row=0, column=4, padx=(8, 18))
         ttk.Button(control, text="电机启停（单次脉冲）", command=self.request_start_button).grid(row=0, column=5)
+        ttk.Button(control, text="重置里程计（单次脉冲）", command=self.request_reset_odometry).grid(row=0, column=6, padx=(8, 0))
         ttk.Label(control, text="平移幅值").grid(row=1, column=0, pady=(7, 0), sticky=tk.W)
         ttk.Scale(control, from_=0.0, to=1.0, variable=self.translation_scale_var, orient=tk.HORIZONTAL, length=160).grid(
             row=1, column=1, columnspan=2, pady=(7, 0), sticky=tk.W
@@ -677,7 +813,16 @@ class TelemetryMonitorApp:
         ttk.Button(vision_controls, text="扫描相机", command=self.scan_cameras).pack(side=tk.LEFT)
         ttk.Button(vision_controls, text="启动定位", command=self.start_camera).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(vision_controls, text="停止定位", command=self.stop_camera).pack(side=tk.LEFT, padx=(6, 14))
-        ttk.Label(vision, text="固定标定：RGB 1280×720；ID 10/11/12/13；黑边 93 mm；中心距 140 mm").pack(
+        video_controls = ttk.Frame(vision)
+        video_controls.pack(fill=tk.X, pady=(5, 0))
+        ttk.Button(video_controls, text="开始录制 1080P/30FPS", command=self.start_video_recording).pack(side=tk.LEFT)
+        ttk.Button(video_controls, text="停止录制", command=self.stop_video_recording).pack(side=tk.LEFT, padx=(6, 14))
+        ttk.Label(video_controls, textvariable=self.video_recording_var).pack(side=tk.LEFT)
+        ttk.Label(
+            vision,
+            text="录制采集：1920×1080 @ 30 FPS；定位使用缩放后的标定 RGB 1280×720；"
+                 "ID 10/11/12/13；黑边 93 mm；中心距 140 mm",
+        ).pack(
             anchor=tk.W, pady=(5, 0)
         )
 
@@ -701,19 +846,28 @@ class TelemetryMonitorApp:
         )
         self.camera_preview.grid(row=2, column=0, sticky=tk.NSEW)
 
-        chart_frame = ttk.LabelFrame(root_frame, text="推进器转速（最近 10 秒）", padding=6)
+        chart_frame = ttk.LabelFrame(root_frame, text="预测数据（最近 10 秒）", padding=6)
         chart_frame.grid(row=1, column=1, sticky=tk.NSEW, pady=(8, 0))
-        chart_frame.rowconfigure(1, weight=1)
+        chart_frame.rowconfigure(2, weight=1)
         chart_frame.columnconfigure(0, weight=1)
+        group_controls = ttk.Frame(chart_frame)
+        group_controls.grid(row=0, column=0, sticky=tk.W, pady=(0, 5))
+        ttk.Label(group_controls, text="显示组").pack(side=tk.LEFT)
+        for group_index, (group_name, _channels) in enumerate(self.CHART_GROUPS):
+            ttk.Button(
+                group_controls,
+                text=group_name,
+                command=lambda index=group_index: self.select_chart_group(index),
+            ).pack(side=tk.LEFT, padx=(6, 0))
         axis_controls = ttk.Frame(chart_frame)
-        axis_controls.grid(row=0, column=0, sticky=tk.W, pady=(0, 5))
+        axis_controls.grid(row=1, column=0, sticky=tk.W, pady=(0, 5))
         ttk.Label(axis_controls, text="固定 Y 轴下界").pack(side=tk.LEFT)
         ttk.Entry(axis_controls, textvariable=self.y_axis_min_var, width=10).pack(side=tk.LEFT, padx=(5, 12))
         ttk.Label(axis_controls, text="固定 Y 轴上界").pack(side=tk.LEFT)
         ttk.Entry(axis_controls, textvariable=self.y_axis_max_var, width=10).pack(side=tk.LEFT, padx=(5, 10))
         ttk.Button(axis_controls, text="应用 Y 轴范围", command=self.apply_y_axis_limits).pack(side=tk.LEFT)
         self.chart = tk.Canvas(chart_frame, background="#101418", highlightthickness=0)
-        self.chart.grid(row=1, column=0, sticky=tk.NSEW)
+        self.chart.grid(row=2, column=0, sticky=tk.NSEW)
         self.chart.bind("<Configure>", lambda _event: self._draw_chart())
 
     def apply_listener(self) -> None:
@@ -758,6 +912,38 @@ class TelemetryMonitorApp:
             daemon=True,
         ).start()
 
+    def start_video_recording(self) -> None:
+        worker = self.vision_worker
+        if worker is None or not worker.is_alive():
+            messagebox.showerror("无法开始录制", "请先启动相机定位，并确认相机已成功打开。")
+            return
+        VIDEO_ROOT.mkdir(parents=True, exist_ok=True)
+        filename = filedialog.asksaveasfilename(
+            title="保存 1080P 视频",
+            defaultextension=".mp4",
+            filetypes=(("MP4 视频", "*.mp4"),),
+            initialdir=VIDEO_ROOT,
+            initialfile=f"rov_video_{datetime.now():%Y%m%d_%H%M%S}.mp4",
+        )
+        if not filename:
+            return
+        path = Path(filename)
+        if path.exists() and not messagebox.askyesno(
+            "覆盖已有视频？",
+            f"视频文件已存在：\n{path}\n\n是否覆盖？",
+        ):
+            return
+        worker.start_recording(path)
+        self.video_recording_var.set("视频录制：等待 1080P 相机帧…")
+
+    def stop_video_recording(self) -> None:
+        worker = self.vision_worker
+        if worker is None:
+            self.video_recording_var.set("视频录制：已停止")
+            return
+        worker.stop_recording()
+        self.video_recording_var.set("视频录制：正在停止并保存文件…")
+
     def start_camera(self) -> None:
         try:
             camera_index = int(self.camera_index_var.get())
@@ -784,6 +970,7 @@ class TelemetryMonitorApp:
         if worker is not None:
             worker.stop()
             worker.join(timeout=1.5)
+        self.video_recording_var.set("视频录制：已停止")
         self.vision_snapshot = VisionSnapshot.unavailable("相机已停止")
         self.vision_status_var.set("视觉定位：相机已停止")
         self.vision_pose_var.set("全局（相机坐标）X: --   Y: --   yaw: --")
@@ -812,6 +999,10 @@ class TelemetryMonitorApp:
     def request_start_button(self) -> None:
         self.start_pulse_ticks = 1
         self.control_status_var.set("将在下一控制周期发送 startButton 1→0 脉冲")
+
+    def request_reset_odometry(self) -> None:
+        self.reset_io_pulse_ticks = 1
+        self.control_status_var.set("将在下一控制周期发送 resetIO 1→0 脉冲")
 
     def _tracking_settings(self) -> TrackingSettings:
         try:
@@ -905,6 +1096,7 @@ class TelemetryMonitorApp:
         self.last_tracking_command = None
         self._clear_motion()
         self.start_pulse_ticks = 0
+        self.reset_io_pulse_ticks = 0
         if was_active or reason:
             self.trajectory_status_var.set(f"轨迹已停止：{reason}")
         if transmit_immediately:
@@ -924,6 +1116,12 @@ class TelemetryMonitorApp:
             return
         self.chart_y_min = minimum
         self.chart_y_max = maximum
+        self._draw_chart()
+
+    def select_chart_group(self, group_index: int) -> None:
+        if not 0 <= group_index < len(self.CHART_GROUPS):
+            return
+        self.chart_group_index = group_index
         self._draw_chart()
 
     def _on_key_press(self, event: tk.Event[tk.Misc]) -> str | None:
@@ -981,6 +1179,7 @@ class TelemetryMonitorApp:
         else:
             yaw, forward, left_right = self._movement_values()
         start_button = int(self.start_pulse_ticks > 0)
+        reset_io = int(self.reset_io_pulse_ticks > 0)
         pose_fields = {}
         if pose is not None:
             # Only quality-gated, fresh AprilTag data is forwarded to the A board.
@@ -997,6 +1196,7 @@ class TelemetryMonitorApp:
             forward_speed=forward,
             left_right_speed=left_right,
             start_button=start_button,
+            reset_io=reset_io,
             enable_path_tracking=enable_path_tracking,
             **pose_fields,
         )
@@ -1004,6 +1204,8 @@ class TelemetryMonitorApp:
             self.control_transmitter.send(frame)
             if start_button:
                 self.start_pulse_ticks -= 1
+            if reset_io:
+                self.reset_io_pulse_ticks -= 1
             self.control_status_var.set(
                 f"控制发送中：yaw={yaw:+.2f}，forward={forward:+.2f}，left={left_right:+.2f}，"
                 f"目标 {self.control_transmitter.destination[0]}:{self.control_transmitter.destination[1]}"
@@ -1083,6 +1285,9 @@ class TelemetryMonitorApp:
         self.root.after(40, self._refresh)
 
     def _refresh_vision(self) -> None:
+        worker = self.vision_worker
+        if worker is not None:
+            self.video_recording_var.set(worker.recording_status())
         last_frame: VisionFrame | None = None
         while True:
             try:
@@ -1125,7 +1330,7 @@ class TelemetryMonitorApp:
             from PIL import Image, ImageTk
 
             image = Image.fromarray(image_bgr[:, :, ::-1])
-            # 限制预览高度，保证右下角推进器转速图始终保留可见空间。
+            # 限制预览高度，保证右下角预测数据图始终保留可见空间。
             image.thumbnail((720, 300))
             self.preview_image = ImageTk.PhotoImage(image=image)
             self.camera_preview.configure(image=self.preview_image, text="")
@@ -1141,6 +1346,9 @@ class TelemetryMonitorApp:
                 packet.odom_global_x_velocity,
                 packet.odom_global_y_velocity,
                 packet.odom_global_yaw_rate,
+                packet.odom_global_x,
+                packet.odom_global_y,
+                packet.odom_global_yaw,
                 packet.network_body_x_velocity,
                 packet.network_body_y_velocity,
                 packet.network_body_yaw_rate,
@@ -1162,10 +1370,17 @@ class TelemetryMonitorApp:
             return
 
         canvas.delete("all")
-        margin_left, margin_right, margin_top, margin_bottom = 64, 18, 30, 40
+        margin_left, margin_right, margin_top, margin_bottom = 82, 18, 30, 28
         plot_width = max(1, width - margin_left - margin_right)
         plot_height = max(1, height - margin_top - margin_bottom)
-        canvas.create_text(margin_left, 12, anchor=tk.W, fill="#dcdde1", text="里程计/网络预测速度（共享纵轴）")
+        group_name, channels = self.CHART_GROUPS[self.chart_group_index]
+        canvas.create_text(
+            margin_left,
+            12,
+            anchor=tk.W,
+            fill="#dcdde1",
+            text=f"{group_name}：每个数据独立横栏；固定范围 [{self.chart_y_min:g}, {self.chart_y_max:g}]",
+        )
 
         if not self.chart_samples:
             canvas.create_text(width / 2, height / 2, fill="#7f8c8d", text="等待有效 UDP 遥测数据")
@@ -1176,12 +1391,6 @@ class TelemetryMonitorApp:
         minimum = self.chart_y_min
         maximum = self.chart_y_max
 
-        for division in range(5):
-            y = margin_top + plot_height * division / 4
-            value = maximum - (maximum - minimum) * division / 4
-            canvas.create_line(margin_left, y, width - margin_right, y, fill="#2f3640")
-            canvas.create_text(margin_left - 6, y, anchor=tk.E, fill="#bdc3c7", text=f"{value:.0f}")
-
         for seconds_back in range(0, int(CHART_HISTORY_SECONDS) + 1, 2):
             x = width - margin_right - plot_width * seconds_back / CHART_HISTORY_SECONDS
             canvas.create_line(x, margin_top, x, height - margin_bottom, fill="#20252b")
@@ -1189,17 +1398,24 @@ class TelemetryMonitorApp:
 
         stride = max(1, (len(visible) + MAX_DRAW_SAMPLES - 1) // MAX_DRAW_SAMPLES)
         sampled = visible[::stride]
-        for velocity_index, color in enumerate(self.COLORS):
+        lane_height = plot_height / len(channels)
+        for lane_index, (label, value_index, color) in enumerate(channels):
+            lane_top = margin_top + lane_index * lane_height
+            lane_bottom = lane_top + lane_height
+            canvas.create_line(margin_left, lane_top, width - margin_right, lane_top, fill="#485460")
+            canvas.create_line(margin_left, lane_bottom, width - margin_right, lane_bottom, fill="#485460")
+            canvas.create_line(margin_left, (lane_top + lane_bottom) / 2, width - margin_right, (lane_top + lane_bottom) / 2, fill="#2f3640")
+            canvas.create_text(4, lane_top + 8, anchor=tk.W, fill=color, text=label)
+            canvas.create_text(margin_left - 6, lane_top + 4, anchor=tk.E, fill="#bdc3c7", text=f"{maximum:g}")
+            canvas.create_text(margin_left - 6, lane_bottom - 4, anchor=tk.E, fill="#bdc3c7", text=f"{minimum:g}")
             points: list[float] = []
-            for sample_time, velocities in sampled:
+            for sample_time, values in sampled:
                 x = margin_left + (sample_time - (latest_time - CHART_HISTORY_SECONDS)) / CHART_HISTORY_SECONDS * plot_width
-                y = margin_top + (maximum - velocities[velocity_index]) / (maximum - minimum) * plot_height
+                value = max(minimum, min(maximum, values[value_index]))
+                y = lane_top + (maximum - value) / (maximum - minimum) * lane_height
                 points.extend((x, y))
             if len(points) >= 4:
                 canvas.create_line(*points, fill=color, width=1.5, smooth=False)
-            legend_x = margin_left + velocity_index * 90
-            canvas.create_rectangle(legend_x, height - 19, legend_x + 10, height - 9, fill=color, outline=color)
-            canvas.create_text(legend_x + 14, height - 14, anchor=tk.W, fill="#dcdde1", text=self.VELOCITY_LABELS[velocity_index])
 
     def close(self) -> None:
         self._clear_motion()
