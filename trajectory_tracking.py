@@ -1,4 +1,4 @@
-"""CSV waypoint planning and AprilTag closed-loop tracking primitives."""
+"""CSV waypoint planning and source-independent closed-loop tracking primitives."""
 
 from __future__ import annotations
 
@@ -102,7 +102,7 @@ def load_waypoints(path: Path) -> tuple[Waypoint, ...]:
         raise TrajectoryError("轨迹至少需要两个关键点")
     first = points[0]
     if abs(first.x_m) > ORIGIN_TOLERANCE_M or abs(first.y_m) > ORIGIN_TOLERANCE_M:
-        raise TrajectoryError("CSV 首个关键点必须为相机全局原点 (0,0)")
+        raise TrajectoryError("CSV 首个关键点必须为局部轨迹原点 (0,0)")
     return tuple(points)
 
 

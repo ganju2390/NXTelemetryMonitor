@@ -34,7 +34,8 @@ class DemoTrajectoryV2Tests(unittest.TestCase):
         self.assertGreater(POINT_COUNT * DURATION_S, 120.0)
 
     def test_written_csvs_use_the_existing_loader_contract(self) -> None:
-        files = sorted(ROOT.glob("[0-9][0-9][0-9]_*.csv"))
+        with (ROOT / 'manifest.csv').open(encoding='utf-8', newline='') as stream:
+            files = [ROOT / row['filename'] for row in csv.DictReader(stream)]
         self.assertEqual(24, len(files))
         for path in files:
             waypoints = load_waypoints(path)

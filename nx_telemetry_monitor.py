@@ -1431,9 +1431,8 @@ class TelemetryMonitorApp:
 
 
 def main() -> None:
-    root = tk.Tk()
-    TelemetryMonitorApp(root)
-    root.mainloop()
+    from groundstation.app import main as run_groundstation
+    run_groundstation()
 
 
 if __name__ == "__main__":
