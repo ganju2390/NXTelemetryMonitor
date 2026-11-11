@@ -1,2 +1,7 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Preserve upstream generator output and keep generated diffs folded on GitHub.
+protocol/generated/** linguist-generated=true -whitespace
+groundstation/generated/finsrov.py linguist-generated=true -whitespace
+protocol/minimal.xml linguist-vendored=true -whitespace
