@@ -1,6 +1,12 @@
 .venv/
 __pycache__/
 *.pyc
+recordings/
+videos/
+dataset/
+build/
+.pytest_cache/
+*.log
 *.csv
 !trajectories/
 !trajectories/*.csv
