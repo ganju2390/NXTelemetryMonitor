@@ -8,6 +8,8 @@
 
 | 资料 | 内容 |
 | --- | --- |
+| [开发交接文档](docs/development-handoff.md) | 当前实现、代码入口、接口约定、验收证据与接入资料 |
+| [后续开发安排](docs/roadmap.md) | NX、嵌入式、整链联调和水下实验的阶段任务与验收条件 |
 | [操作与开发说明](docs/groundstation.md) | 启动、模式切换、轨迹、视频、相机和记录 |
 | [通信协议](docs/protocol.md) | 消息 ID、坐标系、会话、确认、过期与重放处理 |
 | [验收记录](docs/validation.md) | 自动化、模拟闭环和实机待验证项 |
